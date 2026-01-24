@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+import torch
 from statsmodels.tsa.stattools import acf
 
 TRAIN_START = datetime(2022, 1, 1)
@@ -29,6 +30,7 @@ TARGET_LABEL = "adjMidRet60s"
 FEATURE_PREFIX = "x_"
 MAX_LAGS = 50
 RANDOM_SEED = 42
+STATS_PATH = "feature_stats.pt"
 
 
 @dataclass
@@ -135,6 +137,70 @@ def normalize_features(df: pd.DataFrame, groups: FeatureGroups) -> pd.DataFrame:
     return normalized
 
 
+def _mad(series: pd.Series) -> float:
+    median = series.median()
+    return (series - median).abs().median()
+
+
+def compute_feature_stats(df: pd.DataFrame, groups: FeatureGroups) -> dict:
+    """Compute training-only feature stats compatible with DayReader."""
+    smooth_cols = groups.smooth
+    heavy_cols = groups.heavy_tailed
+    discrete_cols = groups.discrete
+
+    smooth_mean = torch.tensor(
+        df[smooth_cols].mean().to_numpy(dtype=np.float32), dtype=torch.float32
+    )
+    smooth_std = torch.tensor(
+        df[smooth_cols].std(ddof=0).replace(0, 1.0).to_numpy(dtype=np.float32),
+        dtype=torch.float32,
+    )
+
+    heavy_median_vals = df[heavy_cols].median()
+    heavy_mad_vals = df[heavy_cols].apply(_mad).replace(0, 1.0)
+    heavy_median = torch.tensor(
+        heavy_median_vals.to_numpy(dtype=np.float32), dtype=torch.float32
+    )
+    heavy_mad = torch.tensor(
+        heavy_mad_vals.to_numpy(dtype=np.float32), dtype=torch.float32
+    )
+
+    # Clip based on extreme normalized magnitudes to limit outlier influence.
+    clip_vals = []
+    for col in heavy_cols:
+        median = heavy_median_vals[col]
+        mad = heavy_mad_vals[col]
+        normalized = (df[col] - median) / mad
+        clip_vals.append(float(normalized.abs().quantile(0.995)))
+    heavy_clip = torch.tensor(np.array(clip_vals, dtype=np.float32))
+    heavy_clip = torch.where(heavy_clip > 0, heavy_clip, torch.ones_like(heavy_clip))
+
+    # Scale discrete features by their max absolute value to keep them bounded.
+    discrete_scale_vals = (
+        df[discrete_cols].abs().max().replace(0, 1.0).to_numpy(dtype=np.float32)
+    )
+    discrete_scale = torch.tensor(discrete_scale_vals, dtype=torch.float32)
+
+    feature_stats = {
+        "smooth": {"cols": smooth_cols, "mean": smooth_mean, "std": smooth_std},
+        "heavy": {
+            "cols": heavy_cols,
+            "median": heavy_median,
+            "mad": heavy_mad,
+            "clip": heavy_clip,
+        },
+        "discrete": {"cols": discrete_cols, "scale": discrete_scale},
+    }
+    return feature_stats
+
+
+def save_feature_stats(df: pd.DataFrame, groups: FeatureGroups, path: str) -> dict:
+    """Persist feature statistics for the training pipeline."""
+    stats = compute_feature_stats(df, groups)
+    torch.save(stats, path)
+    return stats
+
+
 def plot_acf(series: pd.Series, title: str, ax: plt.Axes) -> None:
     values = series.dropna().values
     if len(values) == 0:
@@ -236,6 +302,9 @@ def main() -> None:
     print(f"Heavy-tailed features: {len(groups.heavy_tailed)}")
     print(f"Smooth features: {len(groups.smooth)}")
     print(f"Discrete features: {len(groups.discrete)}")
+
+    save_feature_stats(df_clean, groups, STATS_PATH)
+    print(f"Saved feature statistics to {STATS_PATH}.")
 
     df_normalized = normalize_features(df_clean, groups)
 
