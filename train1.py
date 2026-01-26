@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 import os
+import pickle
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,16 +14,14 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from dataset.block_dataset import BlockDataset, BlockEntry, load_block_table
+from dataset.block_dataset import BlockDataset, IndexEntry
 from model import GRUModel, LSTMModel, ModelConfig, TCNModel, TransformerModel
 
 
 @dataclass
 class Train1Config:
     tensor_root: str = "./global_data"
-    block_table_path: str = "./global_data/block_table.pkl"
     window: int = 64
-    block_len: int = 512
     batch_size: int = 256
     max_epochs: int = 20
     patience: int = 5
@@ -78,17 +77,62 @@ def compute_group_metrics(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
-def _filter_blocks(
-    blocks: Sequence[BlockEntry], start: str, end: str
-) -> List[BlockEntry]:
-    return [b for b in blocks if start <= str(b["day"]) <= end]
+def build_index_from_segments(
+    segments: Sequence[Dict[str, object]],
+    window: int,
+    start: str,
+    end: str,
+) -> List[IndexEntry]:
+    index: List[IndexEntry] = []
+    for seg in segments:
+        day = str(seg["day"])
+        if not (start <= day <= end):
+            continue
+        seg_start = int(seg["start_idx"])
+        length = int(seg["length"])
+        if length <= window:
+            continue
+        index.extend(range(seg_start + window, seg_start + length))
+    return index
+
+
+def build_segment_ranges(
+    segments: Sequence[Dict[str, object]],
+) -> Tuple[List[int], List[Tuple[int, str, str]]]:
+    ranges = []
+    for seg in segments:
+        start = int(seg["start_idx"])
+        end = start + int(seg["length"])
+        ranges.append((start, end, str(seg["day"]), str(seg["skey"])))
+    ranges.sort(key=lambda r: r[0])
+    starts = [r[0] for r in ranges]
+    meta = [(r[1], r[2], r[3]) for r in ranges]
+    return starts, meta
+
+
+def find_segment_meta(
+    t_end: int, starts: List[int], meta: List[Tuple[int, str, str]]
+) -> Tuple[str, str]:
+    idx = int(np.searchsorted(starts, t_end, side="right") - 1)
+    if idx < 0:
+        raise IndexError("t_end before any segment start.")
+    end, day, skey = meta[idx]
+    if t_end > end:
+        raise IndexError("t_end exceeds segment end.")
+    return day, skey
 
 
 @torch.no_grad()
-def collect_predictions(model: nn.Module, loader: DataLoader, device: str) -> pd.DataFrame:
+def collect_predictions(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    starts: List[int],
+    meta: List[Tuple[int, str, str]],
+) -> pd.DataFrame:
     model.eval()
     dataset: BlockDataset = loader.dataset  # type: ignore[assignment]
-    blocks = dataset.block_table
+    index_table = dataset.index_table
     rows: List[dict] = []
     offset = 0
 
@@ -98,14 +142,15 @@ def collect_predictions(model: nn.Module, loader: DataLoader, device: str) -> pd
         y = yb.detach().cpu().numpy()
 
         batch_size = len(y)
-        batch_blocks = blocks[offset : offset + batch_size]
+        batch_index = index_table[offset : offset + batch_size]
         offset += batch_size
 
-        for i, block in enumerate(batch_blocks):
+        for i, t_end in enumerate(batch_index):
+            day, skey = find_segment_meta(int(t_end), starts, meta)
             rows.append(
                 {
-                    "date": block["day"],
-                    "stock": block["skey"],
+                    "date": day,
+                    "stock": skey,
                     "y": float(y[i]),
                     "pred": float(pred[i]),
                 }
@@ -150,14 +195,18 @@ def main() -> None:
     cfg = Train1Config()
     os.makedirs(cfg.save_dir, exist_ok=True)
 
-    block_table = load_block_table(cfg.block_table_path)
-    train_blocks = _filter_blocks(block_table, cfg.train_start, cfg.train_end)
-    val_blocks = _filter_blocks(block_table, cfg.val_start, cfg.val_end)
-    test_blocks = _filter_blocks(block_table, cfg.test_start, cfg.test_end)
+    segment_table_path = os.path.join(cfg.tensor_root, "segment_table.pkl")
+    with open(segment_table_path, "rb") as f:
+        segments = pickle.load(f)
 
-    train_ds = BlockDataset(train_blocks, cfg.tensor_root, cfg.window, cfg.block_len)
-    val_ds = BlockDataset(val_blocks, cfg.tensor_root, cfg.window, cfg.block_len)
-    test_ds = BlockDataset(test_blocks, cfg.tensor_root, cfg.window, cfg.block_len)
+    train_index = build_index_from_segments(segments, cfg.window, cfg.train_start, cfg.train_end)
+    val_index = build_index_from_segments(segments, cfg.window, cfg.val_start, cfg.val_end)
+    test_index = build_index_from_segments(segments, cfg.window, cfg.test_start, cfg.test_end)
+    starts, meta = build_segment_ranges(segments)
+
+    train_ds = BlockDataset(train_index, cfg.tensor_root, cfg.window)
+    val_ds = BlockDataset(val_index, cfg.tensor_root, cfg.window)
+    test_ds = BlockDataset(test_index, cfg.tensor_root, cfg.window)
 
     train_loader = DataLoader(
         train_ds,
@@ -223,7 +272,7 @@ def main() -> None:
         train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
 
         val_loss = compute_loss(model, val_loader, cfg.device, loss_fn)
-        val_df = collect_predictions(model, val_loader, cfg.device)
+        val_df = collect_predictions(model, val_loader, cfg.device, starts, meta)
         val_metrics = compute_group_metrics(val_df)
 
         history["epoch"].append(epoch)
@@ -254,7 +303,7 @@ def main() -> None:
                 break
 
     model.load_state_dict(best_state)
-    test_df = collect_predictions(model, test_loader, cfg.device)
+    test_df = collect_predictions(model, test_loader, cfg.device, starts, meta)
     test_metrics = compute_group_metrics(test_df)
 
     history_df = pd.DataFrame(history)

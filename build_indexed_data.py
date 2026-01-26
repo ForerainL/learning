@@ -1,8 +1,9 @@
-"""Offline normalization to build global tensors and block metadata.
+"""Offline preprocessing to save per-(day,skey) tensors and index_table.
 
-This script is intentionally slow and run once. It produces:
-- X_all.pt / y_all.pt: contiguous tensors for fast training
-- segment_table.pkl / block_table.pkl: boundaries for safe sampling
+Output format per file:
+  output_root/YYYYMMDD/SKEY.pt  -> {"X": Tensor[Ti,F], "y": Tensor[Ti]}
+
+index_table.pkl contains (day, skey, t_end) for all valid windows.
 """
 
 from __future__ import annotations
@@ -17,8 +18,7 @@ import pandas as pd
 import torch
 
 
-
-def discover_all_days(data_root: str) -> List[str]:
+def discover_days(data_root: str) -> List[str]:
     return sorted(d for d in os.listdir(data_root) if d.isdigit() and len(d) == 8)
 
 
@@ -99,14 +99,15 @@ def normalize_zero_dominant(x: np.ndarray, stats: Dict[str, object]) -> np.ndarr
     return normalized
 
 
-def process_skey(
+def process_one_file(
     path: str,
     feature_cols: List[str],
     group_cols: Dict[str, List[str]],
     stats: Dict[str, Dict[str, object]],
+    label_col: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    df = pd.read_parquet(path, columns=feature_cols + ["adjMidRet60s"])
-    df = df.dropna(subset=["adjMidRet60s"])
+    df = pd.read_parquet(path, columns=feature_cols + [label_col])
+    df = df.dropna(subset=[label_col])
 
     df[feature_cols] = df[feature_cols].ffill()
 
@@ -126,15 +127,53 @@ def process_skey(
 
     x = np.concatenate([xs, xh, xd, xz], axis=1).astype(np.float32)
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-    y = df["adjMidRet60s"].to_numpy(dtype=np.float32)
+    y = df[label_col].to_numpy(dtype=np.float32)
     return x, y
 
 
-def build_tables(
+def build_index_table(
     data_root: str,
+    output_root: str,
+    days: List[str],
+    feature_cols: List[str],
+    group_cols: Dict[str, List[str]],
     stats: Dict[str, Dict[str, object]],
+    label_col: str,
     window: int,
-) -> Tuple[torch.Tensor, torch.Tensor, List[dict], List[int]]:
+) -> List[Tuple[str, str, int]]:
+    index_table: List[Tuple[str, str, int]] = []
+
+    for day in days:
+        day_dir = os.path.join(output_root, day)
+        os.makedirs(day_dir, exist_ok=True)
+
+        raw_day_dir = os.path.join(data_root, day)
+        skey_files = sorted(f for f in os.listdir(raw_day_dir) if f.endswith(".parquet"))
+        for skey_file in skey_files:
+            skey = os.path.splitext(skey_file)[0]
+            path = os.path.join(raw_day_dir, skey_file)
+            x_np, y_np = process_one_file(path, feature_cols, group_cols, stats, label_col)
+            if len(y_np) == 0:
+                continue
+            payload = {"X": torch.from_numpy(x_np), "y": torch.from_numpy(y_np)}
+            torch.save(payload, os.path.join(day_dir, f"{skey}.pt"))
+
+            for t_end in range(window, len(y_np)):
+                index_table.append((day, skey, t_end))
+
+    return index_table
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build per-(day,skey) tensors and index table.")
+    parser.add_argument("--data-root", default="./data", help="Raw data root.")
+    parser.add_argument("--output-root", default="./tensor_data", help="Output root.")
+    parser.add_argument("--stats-path", default="feature_stat.pt", help="Feature stats file.")
+    parser.add_argument("--label-col", default="adjMidRet60s", help="Label column name.")
+    parser.add_argument("--window", type=int, default=64, help="Window length.")
+    args = parser.parse_args()
+
+    stats = load_feature_stats(args.stats_path)
     smooth_cols = list(stats["smooth"]["cols"])
     heavy_cols = list(stats["heavy_tail"]["cols"])
     discrete_cols = list(stats["discrete"]["cols"])
@@ -148,80 +187,20 @@ def build_tables(
         "zero_dominant": zero_cols,
     }
 
-    x_segments: List[torch.Tensor] = []
-    y_segments: List[torch.Tensor] = []
-    segment_table: List[dict] = []
-    index_table: List[int] = []
+    days = discover_days(args.data_root)
+    index_table = build_index_table(
+        args.data_root,
+        args.output_root,
+        days,
+        feature_cols,
+        group_cols,
+        stats,
+        args.label_col,
+        args.window,
+    )
 
-    cursor = 0
-
-    for day in discover_all_days(data_root):
-        day_dir = os.path.join(data_root, day)
-        skey_files = sorted(
-            f for f in os.listdir(day_dir) if f.endswith(".parquet")
-        )
-        for skey_file in skey_files:
-            skey = os.path.splitext(skey_file)[0]
-            path = os.path.join(day_dir, skey_file)
-            x_np, y_np = process_skey(path, feature_cols, group_cols, stats)
-            length = len(y_np)
-            if length == 0:
-                continue
-
-            x_tensor = torch.from_numpy(x_np)
-            y_tensor = torch.from_numpy(y_np)
-
-            segment_table.append(
-                {
-                    "day": day,
-                    "skey": skey,
-                    "start_idx": cursor,
-                    "length": length,
-                }
-            )
-
-            if length > window:
-                start = cursor + window
-                end = cursor + length
-                index_table.extend(range(start, end))
-
-            x_segments.append(x_tensor)
-            y_segments.append(y_tensor)
-            cursor += length
-
-    x_all = torch.cat(x_segments, dim=0).to(dtype=torch.float32)
-    y_all = torch.cat(y_segments, dim=0).to(dtype=torch.float32)
-    return x_all, y_all, segment_table, index_table
-
-
-def save_outputs(
-    output_root: str,
-    x_all: torch.Tensor,
-    y_all: torch.Tensor,
-    segment_table: List[dict],
-    index_table: List[int],
-) -> None:
-    os.makedirs(output_root, exist_ok=True)
-    torch.save(x_all, os.path.join(output_root, "X_all.pt"))
-    torch.save(y_all, os.path.join(output_root, "y_all.pt"))
-
-    with open(os.path.join(output_root, "segment_table.pkl"), "wb") as f:
-        pickle.dump(segment_table, f)
-    with open(os.path.join(output_root, "index_table.pkl"), "wb") as f:
+    with open(os.path.join(args.output_root, "index_table.pkl"), "wb") as f:
         pickle.dump(index_table, f)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build offline training data.")
-    parser.add_argument("--data-root", default="./data", help="Raw data root.")
-    parser.add_argument("--output-root", default="./global_data", help="Output root.")
-    parser.add_argument("--stats-path", default="feature_stat.pt", help="Feature stats file.")
-    parser.add_argument("--window", type=int, default=64, help="Window length.")
-    args = parser.parse_args()
-
-    stats = load_feature_stats(args.stats_path)
-    x_all, y_all, segment_table, index_table = build_tables(args.data_root, stats, args.window)
-    save_outputs(args.output_root, x_all, y_all, segment_table, index_table)
 
 
 if __name__ == "__main__":
