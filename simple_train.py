@@ -14,8 +14,7 @@ import glob
 import math
 import os
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,10 +44,12 @@ class DataConfig:
     cache_size: int = 128
     num_workers: int = 0
 
-    train_start: str = "2022-01-01"
-    train_end: str = "2023-12-31"
-    val_start: str = "2024-01-01"
-    val_end: str = "2024-03-31"
+    train_start: str = "20220101"
+    train_end: str = "20231231"
+    val_start: str = "20240101"
+    val_end: str = "20240331"
+    test_start: str = "20240401"
+    test_end: str = "20241231"
 
 
 @dataclass
@@ -69,6 +70,7 @@ class SimpleTrainConfig:
     max_epochs: int = 20
     patience: int = 5
     early_stop_metric: str = "IC"  # "val_loss" or "IC"
+    val_interval: int = 1  # run validation every N epochs
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
 
@@ -89,30 +91,16 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def _to_date(d: str) -> date:
-    return datetime.strptime(d, "%Y-%m-%d").date()
-
-
-def iter_days(start: str, end: str) -> Iterable[str]:
-    cur = _to_date(start)
-    end_d = _to_date(end)
-    while cur <= end_d:
-        yield cur.isoformat()
-        cur += timedelta(days=1)
+def discover_all_days(data_root: str) -> List[str]:
+    return sorted(
+        d for d in os.listdir(data_root) if d.isdigit() and len(d) == 8
+    )
 
 
 def discover_skeys(data_root: str, day: str) -> List[str]:
     pattern = os.path.join(data_root, day, "*.parquet")
     files = glob.glob(pattern)
     return sorted(os.path.splitext(os.path.basename(p))[0] for p in files)
-
-
-def build_days_in_range(cfg: DataConfig, start: str, end: str) -> List[str]:
-    days: List[str] = []
-    for day in iter_days(start, end):
-        if os.path.isdir(os.path.join(cfg.data_root, day)):
-            days.append(day)
-    return days
 
 
 def build_meta(data_root: str, days: Sequence[str]) -> Dict[Key, int]:
@@ -126,39 +114,46 @@ def build_meta(data_root: str, days: Sequence[str]) -> Dict[Key, int]:
     return meta
 
 
-def build_loaders(cfg: SimpleTrainConfig) -> Tuple[DataLoader, DataLoader]:
+def _make_loader(
+    days: List[str],
+    cfg: SimpleTrainConfig,
+    cache: DayCache,
+    shuffle: bool,
+) -> DataLoader:
+    data_cfg = cfg.data
+    meta = build_meta(data_cfg.data_root, days)
+    index = build_index(meta, data_cfg.window)
+    ds = TimeSeriesDataset(index, cache, data_cfg.window)
+    return DataLoader(
+        ds,
+        batch_size=cfg.batch_size,
+        shuffle=shuffle,
+        num_workers=data_cfg.num_workers,
+        drop_last=False,
+    )
+
+
+def build_loaders(cfg: SimpleTrainConfig) -> Tuple[DataLoader, DataLoader, DataLoader]:
     data_cfg = cfg.data
     reader = DayReader(data_cfg.data_root, stats_path=data_cfg.stats_path)
     cache = DayCache(reader, max_size=data_cfg.cache_size)
 
-    train_days = build_days_in_range(data_cfg, data_cfg.train_start, data_cfg.train_end)
-    val_days = build_days_in_range(data_cfg, data_cfg.val_start, data_cfg.val_end)
+    all_days = discover_all_days(data_cfg.data_root)
+    train_days = [
+        d for d in all_days if data_cfg.train_start <= d <= data_cfg.train_end
+    ]
+    val_days = [
+        d for d in all_days if data_cfg.val_start <= d <= data_cfg.val_end
+    ]
+    test_days = [
+        d for d in all_days if data_cfg.test_start <= d <= data_cfg.test_end
+    ]
 
-    train_meta = build_meta(data_cfg.data_root, train_days)
-    val_meta = build_meta(data_cfg.data_root, val_days)
-
-    train_index = build_index(train_meta, data_cfg.window)
-    val_index = build_index(val_meta, data_cfg.window)
-
-    train_ds = TimeSeriesDataset(train_index, cache, data_cfg.window)
-    val_ds = TimeSeriesDataset(val_index, cache, data_cfg.window)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=data_cfg.num_workers,
-        drop_last=False,
-    )
+    train_loader = _make_loader(train_days, cfg, cache, shuffle=True)
     # Keep val_loader ordered so we can map batches to dataset.index.
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=data_cfg.num_workers,
-        drop_last=False,
-    )
-    return train_loader, val_loader
+    val_loader = _make_loader(val_days, cfg, cache, shuffle=False)
+    test_loader = _make_loader(test_days, cfg, cache, shuffle=False)
+    return train_loader, val_loader, test_loader
 
 
 # ======================================================
@@ -287,12 +282,14 @@ def _is_improved(metric: str, score: float, best: float) -> bool:
     return score > best
 
 
-def train(cfg: SimpleTrainConfig) -> Tuple[Dict[str, torch.Tensor], pd.DataFrame, Dict[str, float]]:
+def train(
+    cfg: SimpleTrainConfig,
+) -> Tuple[Dict[str, torch.Tensor], pd.DataFrame, Dict[str, float], Dict[str, float]]:
     """Train with logging + early stopping and save artifacts."""
     set_seed(cfg.seed)
     device = cfg.device
 
-    train_loader, val_loader = build_loaders(cfg)
+    train_loader, val_loader, test_loader = build_loaders(cfg)
 
     model = build_model(cfg).to(device)
     optimizer = build_optimizer(cfg, model)
@@ -331,9 +328,13 @@ def train(cfg: SimpleTrainConfig) -> Tuple[Dict[str, torch.Tensor], pd.DataFrame
 
         train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
 
-        val_loss = compute_loss(model, val_loader, device, loss_fn)
-        val_df = collect_predictions(model, val_loader, device)
-        val_metrics = compute_group_metrics(val_df)
+        val_loss = float("nan")
+        val_metrics = {"IC": float("nan"), "RankIC": float("nan"), "QuantileReturn": float("nan")}
+        do_val = (epoch % cfg.val_interval == 0) or (epoch == cfg.max_epochs - 1)
+        if do_val:
+            val_loss = compute_loss(model, val_loader, device, loss_fn)
+            val_df = collect_predictions(model, val_loader, device)
+            val_metrics = compute_group_metrics(val_df)
 
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
@@ -349,34 +350,42 @@ def train(cfg: SimpleTrainConfig) -> Tuple[Dict[str, torch.Tensor], pd.DataFrame
             f"IC={val_metrics['IC']:.4f}"
         )
 
-        score = val_loss if cfg.early_stop_metric == "val_loss" else val_metrics["IC"]
-        if _is_improved(cfg.early_stop_metric, score, best_score):
-            best_score = score
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            best_val_metrics = val_metrics
-            patience_cnt = 0
-        else:
-            patience_cnt += 1
-            if patience_cnt >= cfg.patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
+        if do_val:
+            score = val_loss if cfg.early_stop_metric == "val_loss" else val_metrics["IC"]
+            if _is_improved(cfg.early_stop_metric, score, best_score):
+                best_score = score
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                best_val_metrics = val_metrics
+                patience_cnt = 0
+            else:
+                patience_cnt += 1
+                if patience_cnt >= cfg.patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
 
     history_df = pd.DataFrame(history)
+
+    model.load_state_dict(best_state)
+    test_df = collect_predictions(model, test_loader, device)
+    test_metrics = compute_group_metrics(test_df)
 
     os.makedirs(cfg.save_dir, exist_ok=True)
     model_path = os.path.join(cfg.save_dir, f"{cfg.run_name}_best.pt")
     hist_path = os.path.join(cfg.save_dir, f"{cfg.run_name}_history.csv")
     metrics_path = os.path.join(cfg.save_dir, f"{cfg.run_name}_val_metrics.json")
+    test_metrics_path = os.path.join(cfg.save_dir, f"{cfg.run_name}_test_metrics.json")
 
     torch.save(best_state, model_path)
     history_df.to_csv(hist_path, index=False)
     pd.Series(best_val_metrics).to_json(metrics_path, force_ascii=False, indent=2)
+    pd.Series(test_metrics).to_json(test_metrics_path, force_ascii=False, indent=2)
 
     print(f"Saved best model to: {model_path}")
     print(f"Saved history to:    {hist_path}")
     print(f"Saved metrics to:    {metrics_path}")
+    print(f"Saved test metrics to: {test_metrics_path}")
 
-    return best_state, history_df, best_val_metrics
+    return best_state, history_df, best_val_metrics, test_metrics
 
 
 if __name__ == "__main__":
