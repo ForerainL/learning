@@ -26,6 +26,7 @@ class Train1Config:
     max_epochs: int = 20
     patience: int = 5
     early_stop_metric: str = "IC"  # "val_loss" or "IC"
+    val_every: int = 1
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     save_dir: str = "./artifacts"
     run_name: str = "train1"
@@ -75,6 +76,23 @@ def compute_group_metrics(df: pd.DataFrame) -> Dict[str, float]:
         "RankIC": _safe_mean(rankic_list),
         "QuantileReturn": _safe_mean(qret_list),
     }
+
+
+def compute_overall_metrics(pred: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+    """Compute overall validation metrics without grouping."""
+    if len(pred) == 0:
+        return {"IC": float("nan"), "RankIC": float("nan"), "R2": float("nan"), "QuantileReturn": float("nan")}
+    pred_series = pd.Series(pred)
+    y_series = pd.Series(y)
+    ic = float(pred_series.corr(y_series))
+    rank_ic = float(pred_series.rank().corr(y_series.rank()))
+    y_mean = float(y_series.mean())
+    denom = float(((y_series - y_mean) ** 2).sum())
+    r2 = float("nan") if denom == 0 else 1.0 - float(((y_series - pred_series) ** 2).sum()) / denom
+    order = np.argsort(pred)
+    q = max(int(0.1 * len(pred)), 1)
+    qret = float(y_series.iloc[order[-q:]].mean() - y_series.iloc[order[:q]].mean())
+    return {"IC": ic, "RankIC": rank_ic, "R2": r2, "QuantileReturn": qret}
 
 
 def build_index_from_segments(
@@ -172,6 +190,34 @@ def compute_loss(model: nn.Module, loader: DataLoader, device: str, loss_fn: nn.
     return float(np.mean(losses)) if losses else float("nan")
 
 
+def run_validation_once(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    loss_fn: nn.Module,
+) -> Tuple[float, Dict[str, float]]:
+    model.eval()
+    loss_sum = 0.0
+    count = 0
+    preds: List[np.ndarray] = []
+    ys: List[np.ndarray] = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            pred = model(xb).squeeze(-1)
+            loss = loss_fn(pred, yb)
+            batch_size = yb.shape[0]
+            loss_sum += loss.detach().float().cpu().item() * batch_size
+            count += batch_size
+            preds.append(pred.detach().cpu().numpy())
+            ys.append(yb.detach().cpu().numpy())
+    val_loss = float("nan") if count == 0 else loss_sum / count
+    pred_all = np.concatenate(preds) if preds else np.array([], dtype=np.float32)
+    y_all = np.concatenate(ys) if ys else np.array([], dtype=np.float32)
+    return val_loss, compute_overall_metrics(pred_all, y_all)
+
+
 def build_model(cfg: Train1Config, input_dim: int) -> nn.Module:
     model_cfg = ModelConfig(
         input_dim=input_dim,
@@ -254,7 +300,8 @@ def main() -> None:
 
     for epoch in range(cfg.max_epochs):
         model.train()
-        train_losses: List[float] = []
+        train_loss_sum = torch.tensor(0.0, device=cfg.device)
+        train_count = 0
 
         for xb, yb in train_loader:
             xb = xb.to(cfg.device, non_blocking=True)
@@ -267,13 +314,16 @@ def main() -> None:
             loss.backward()
             optimizer.step()
 
-            train_losses.append(float(loss.item()))
+            train_loss_sum += loss.detach().float() * yb.shape[0]
+            train_count += yb.shape[0]
 
-        train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
+        train_loss = float("nan") if train_count == 0 else (train_loss_sum / train_count).item()
 
-        val_loss = compute_loss(model, val_loader, cfg.device, loss_fn)
-        val_df = collect_predictions(model, val_loader, cfg.device, starts, meta)
-        val_metrics = compute_group_metrics(val_df)
+        if epoch % cfg.val_every == 0:
+            val_loss, val_metrics = run_validation_once(model, val_loader, cfg.device, loss_fn)
+        else:
+            val_loss = float("nan")
+            val_metrics = {"IC": float("nan"), "RankIC": float("nan"), "R2": float("nan"), "QuantileReturn": float("nan")}
 
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
@@ -289,18 +339,19 @@ def main() -> None:
             f"IC={val_metrics['IC']:.4f}"
         )
 
-        score = val_loss if cfg.early_stop_metric == "val_loss" else val_metrics["IC"]
-        improved = (score < best_score) if cfg.early_stop_metric == "val_loss" else (score > best_score)
-        if not math.isnan(score) and improved:
-            best_score = score
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            best_val_metrics = val_metrics
-            patience_cnt = 0
-        else:
-            patience_cnt += 1
-            if patience_cnt >= cfg.patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
+        if epoch % cfg.val_every == 0:
+            score = val_loss if cfg.early_stop_metric == "val_loss" else val_metrics["IC"]
+            improved = (score < best_score) if cfg.early_stop_metric == "val_loss" else (score > best_score)
+            if not math.isnan(score) and improved:
+                best_score = score
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                best_val_metrics = val_metrics
+                patience_cnt = 0
+            else:
+                patience_cnt += 1
+                if patience_cnt >= cfg.patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
 
     model.load_state_dict(best_state)
     test_df = collect_predictions(model, test_loader, cfg.device, starts, meta)

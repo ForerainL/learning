@@ -137,60 +137,71 @@ def normalize_features(df: pd.DataFrame, groups: FeatureGroups) -> pd.DataFrame:
     return normalized
 
 
-def _mad(series: pd.Series) -> float:
-    median = series.median()
-    return (series - median).abs().median()
+def _feature_range(start: int, end: int) -> List[str]:
+    return [f"x_{i:03d}" for i in range(start, end + 1)]
 
 
 def compute_feature_stats(df: pd.DataFrame, groups: FeatureGroups) -> dict:
-    """Compute training-only feature stats compatible with DayReader."""
-    smooth_cols = groups.smooth
-    heavy_cols = groups.heavy_tailed
-    discrete_cols = groups.discrete
-
-    smooth_mean = torch.tensor(
-        df[smooth_cols].mean().to_numpy(dtype=np.float32), dtype=torch.float32
+    """Compute per-feature stats with fixed type lists and clipping."""
+    zscore_cols = (
+        _feature_range(10, 31)
+        + _feature_range(34, 37)
+        + _feature_range(57, 58)
+        + ["x_045", "x_050"]
+        + _feature_range(63, 70)
     )
-    smooth_std = torch.tensor(
-        df[smooth_cols].std(ddof=0).replace(0, 1.0).to_numpy(dtype=np.float32),
-        dtype=torch.float32,
+    right_skew_cols = (
+        _feature_range(32, 33)
+        + _feature_range(38, 40)
+        + _feature_range(43, 44)
+        + _feature_range(51, 56)
+        + _feature_range(59, 60)
     )
+    all_cols = [f"x_{i:03d}" for i in range(137)]
+    scale_cols = [
+        col for col in all_cols if col not in zscore_cols and col not in right_skew_cols
+    ]
 
-    heavy_median_vals = df[heavy_cols].median()
-    heavy_mad_vals = df[heavy_cols].apply(_mad).replace(0, 1.0)
-    heavy_median = torch.tensor(
-        heavy_median_vals.to_numpy(dtype=np.float32), dtype=torch.float32
-    )
-    heavy_mad = torch.tensor(
-        heavy_mad_vals.to_numpy(dtype=np.float32), dtype=torch.float32
-    )
+    q_low = 0.01
+    q_high = 0.99
+    feature_stats: dict = {}
 
-    # Clip based on extreme normalized magnitudes to limit outlier influence.
-    clip_vals = []
-    for col in heavy_cols:
-        median = heavy_median_vals[col]
-        mad = heavy_mad_vals[col]
-        normalized = (df[col] - median) / mad
-        clip_vals.append(float(normalized.abs().quantile(0.995)))
-    heavy_clip = torch.tensor(np.array(clip_vals, dtype=np.float32))
-    heavy_clip = torch.where(heavy_clip > 0, heavy_clip, torch.ones_like(heavy_clip))
+    for col in all_cols:
+        series = df[col].astype(float)
+        clip_low = float(series.quantile(q_low))
+        clip_high = float(series.quantile(q_high))
+        clipped = series.clip(lower=clip_low, upper=clip_high)
 
-    # Scale discrete features by their max absolute value to keep them bounded.
-    discrete_scale_vals = (
-        df[discrete_cols].abs().max().replace(0, 1.0).to_numpy(dtype=np.float32)
-    )
-    discrete_scale = torch.tensor(discrete_scale_vals, dtype=torch.float32)
+        if col in zscore_cols:
+            mean = float(clipped.mean())
+            std = float(clipped.std(ddof=0))
+            feature_stats[col] = {
+                "type": "zscore",
+                "clip_low": clip_low,
+                "clip_high": clip_high,
+                "mean": mean,
+                "std": std if std != 0 else 1.0,
+            }
+        elif col in right_skew_cols:
+            logged = np.log1p(clipped)
+            log_mean = float(logged.mean())
+            log_std = float(logged.std(ddof=0))
+            feature_stats[col] = {
+                "type": "right_skew",
+                "clip_low": clip_low,
+                "clip_high": clip_high,
+                "log_mean": log_mean,
+                "log_std": log_std if log_std != 0 else 1.0,
+            }
+        else:
+            max_abs = float(np.abs(clipped).max())
+            feature_stats[col] = {
+                "type": "scale",
+                "clip_low": clip_low,
+                "clip_high": clip_high,
+                "max_abs": max_abs if max_abs != 0 else 1.0,
+            }
 
-    feature_stats = {
-        "smooth": {"cols": smooth_cols, "mean": smooth_mean, "std": smooth_std},
-        "heavy": {
-            "cols": heavy_cols,
-            "median": heavy_median,
-            "mad": heavy_mad,
-            "clip": heavy_clip,
-        },
-        "discrete": {"cols": discrete_cols, "scale": discrete_scale},
-    }
     return feature_stats
 
 

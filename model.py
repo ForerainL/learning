@@ -7,7 +7,7 @@ Input shape: (batch, seq_len, features). Output: (batch, 1).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -77,15 +77,21 @@ class TemporalBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.conv1(x)
-        out = out[:, :, :-self.conv1.padding[0]]
+        out = self._trim(out, self.conv1.padding[0])
         out = self.relu(out)
         out = self.dropout(out)
         out = self.conv2(out)
-        out = out[:, :, :-self.conv2.padding[0]]
+        out = self._trim(out, self.conv2.padding[0])
         out = self.relu(out)
         out = self.dropout(out)
         res = x if self.downsample is None else self.downsample(x)
         return out + res
+
+    @staticmethod
+    def _trim(x: torch.Tensor, padding: int) -> torch.Tensor:
+        if padding <= 0:
+            return x
+        return x[:, :, :-padding]
 
 
 class TCNModel(nn.Module):
@@ -115,6 +121,33 @@ class TCNModel(nn.Module):
         return self.head(last)
 
 
+class EncoderBlock(nn.Module):
+    """Transformer encoder block without any normalization layers."""
+
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn_out, _ = self.attn(x, x, x, attn_mask=mask, need_weights=False)
+        x = x + self.attn_dropout(attn_out)
+        x = x + self.ffn(x)
+        return x
+
+
 class TransformerModel(nn.Module):
     """Small Transformer encoder for sequence-to-one regression."""
 
@@ -122,26 +155,37 @@ class TransformerModel(nn.Module):
         super().__init__()
         if config.hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
+        self.num_heads = num_heads
         self.input_proj = nn.Linear(config.input_dim, config.hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=config.hidden_dim * 2,
-            dropout=config.dropout,
-            activation="relu",
-            batch_first=True,
-            norm_first=False,
+        self.blocks = nn.ModuleList(
+            [
+                EncoderBlock(
+                    hidden_dim=config.hidden_dim,
+                    num_heads=num_heads,
+                    dropout=config.dropout,
+                )
+                for _ in range(config.num_layers)
+            ]
         )
-        # Disable normalization by removing the layer norms inside the encoder layer.
-        encoder_layer.norm1 = nn.Identity()
-        encoder_layer.norm2 = nn.Identity()
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
         self.head = nn.Linear(config.hidden_dim, 1)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.input_proj(x)
-        encoded = self.encoder(x, mask=mask)
-        last = encoded[:, -1, :]
+        if mask is not None:
+            if mask.dim() == 2:
+                pass
+            elif mask.dim() == 3:
+                batch = x.shape[0]
+                if mask.shape[0] not in {batch, batch * self.num_heads}:
+                    raise ValueError(
+                        "attn_mask 3D shape must be (B, T, T) or (B*num_heads, T, T)"
+                    )
+            else:
+                raise ValueError("attn_mask must be 2D or 3D")
+
+        for block in self.blocks:
+            x = block(x, mask=mask)
+        last = x[:, -1, :]
         return self.head(last)
 
 
@@ -158,3 +202,17 @@ __all__ = [
     "TransformerModel",
     "count_parameters",
 ]
+
+
+def _self_test() -> None:
+    config = ModelConfig(input_dim=8, hidden_dim=16, num_layers=2, dropout=0.1)
+    model = TransformerModel(config, num_heads=2)
+    x = torch.randn(4, 64, config.input_dim)
+    out = model(x)
+    assert out.shape == (4, 1)
+    loss = out.mean()
+    loss.backward()
+
+
+if __name__ == "__main__":
+    _self_test()
