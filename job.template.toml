@@ -1,0 +1,9 @@
+cmd = [
+  "python3",
+  "simple_train.py",
+  "--lr", "{{LR}}",
+  "--hidden_dim", "{{HIDDEN_DIM}}",
+  "--batch_size", "{{BATCH_SIZE}}",
+  "--seed", "{{SEED}}",
+  "--run_name", "{{RUN_NAME}}"
+]

@@ -9,6 +9,7 @@ It adapts to the existing dataset pipeline:
 
 from __future__ import annotations
 
+import argparse
 import copy
 import glob
 import math
@@ -388,6 +389,77 @@ def train(
     return best_state, history_df, best_val_metrics, test_metrics
 
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
     cfg = SimpleTrainConfig()
+    data_cfg = cfg.data
+    parser = argparse.ArgumentParser(description="Run a single simple_train experiment.")
+    parser.add_argument("--lr", type=float, default=cfg.lr)
+    parser.add_argument("--hidden_dim", type=int, default=cfg.hidden_dim)
+    parser.add_argument("--batch_size", type=int, default=cfg.batch_size)
+    parser.add_argument("--seed", type=int, default=cfg.seed)
+    parser.add_argument("--run_name", type=str, default=cfg.run_name)
+    parser.add_argument("--model_name", type=str, default=cfg.model_name)
+    parser.add_argument("--input_dim", type=int, default=cfg.input_dim)
+    parser.add_argument("--num_layers", type=int, default=cfg.num_layers)
+    parser.add_argument("--dropout", type=float, default=cfg.dropout)
+    parser.add_argument("--weight_decay", type=float, default=cfg.weight_decay)
+    parser.add_argument("--max_epochs", type=int, default=cfg.max_epochs)
+    parser.add_argument("--patience", type=int, default=cfg.patience)
+    parser.add_argument("--early_stop_metric", type=str, default=cfg.early_stop_metric)
+    parser.add_argument("--val_interval", type=int, default=cfg.val_interval)
+    parser.add_argument("--device", type=str, default=cfg.device)
+    parser.add_argument("--save_dir", type=str, default=cfg.save_dir)
+    parser.add_argument("--data_root", type=str, default=data_cfg.data_root)
+    parser.add_argument("--stats_path", type=str, default=data_cfg.stats_path)
+    parser.add_argument("--window", type=int, default=data_cfg.window)
+    parser.add_argument("--cache_size", type=int, default=data_cfg.cache_size)
+    parser.add_argument("--num_workers", type=int, default=data_cfg.num_workers)
+    parser.add_argument("--train_start", type=str, default=data_cfg.train_start)
+    parser.add_argument("--train_end", type=str, default=data_cfg.train_end)
+    parser.add_argument("--val_start", type=str, default=data_cfg.val_start)
+    parser.add_argument("--val_end", type=str, default=data_cfg.val_end)
+    parser.add_argument("--test_start", type=str, default=data_cfg.test_start)
+    parser.add_argument("--test_end", type=str, default=data_cfg.test_end)
+    return parser
+
+
+def build_config_from_args(args: argparse.Namespace) -> SimpleTrainConfig:
+    data_cfg = DataConfig(
+        data_root=args.data_root,
+        stats_path=args.stats_path,
+        window=args.window,
+        cache_size=args.cache_size,
+        num_workers=args.num_workers,
+        train_start=args.train_start,
+        train_end=args.train_end,
+        val_start=args.val_start,
+        val_end=args.val_end,
+        test_start=args.test_start,
+        test_end=args.test_end,
+    )
+    return SimpleTrainConfig(
+        model_name=args.model_name,
+        input_dim=args.input_dim,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        batch_size=args.batch_size,
+        max_epochs=args.max_epochs,
+        patience=args.patience,
+        early_stop_metric=args.early_stop_metric,
+        val_interval=args.val_interval,
+        device=args.device,
+        seed=args.seed,
+        save_dir=args.save_dir,
+        run_name=args.run_name,
+        data=data_cfg,
+    )
+
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    cfg = build_config_from_args(args)
     train(cfg)
