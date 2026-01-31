@@ -370,11 +370,12 @@ def train(
     test_df = collect_predictions(model, test_loader, device)
     test_metrics = compute_group_metrics(test_df)
 
-    os.makedirs(cfg.save_dir, exist_ok=True)
-    model_path = os.path.join(cfg.save_dir, f"{cfg.run_name}_best.pt")
-    hist_path = os.path.join(cfg.save_dir, f"{cfg.run_name}_history.csv")
-    metrics_path = os.path.join(cfg.save_dir, f"{cfg.run_name}_val_metrics.json")
-    test_metrics_path = os.path.join(cfg.save_dir, f"{cfg.run_name}_test_metrics.json")
+    model_dir = os.path.join(cfg.save_dir, cfg.model_name)
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, f"{cfg.run_name}_best.pt")
+    hist_path = os.path.join(model_dir, f"{cfg.run_name}_history.csv")
+    metrics_path = os.path.join(model_dir, f"{cfg.run_name}_val_metrics.json")
+    test_metrics_path = os.path.join(model_dir, f"{cfg.run_name}_test_metrics.json")
 
     torch.save(best_state, model_path)
     history_df.to_csv(hist_path, index=False)
