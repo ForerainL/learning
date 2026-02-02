@@ -5,12 +5,13 @@ from __future__ import annotations
 import math
 import os
 import pickle
-from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+from torch.nn import functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 
@@ -51,6 +52,12 @@ class Train2Config:
     sam_base: str = "adamw"  # "adamw" | "sgd"
     soap_beta: float = 0.9
     soap_eps: float = 1e-8
+
+    loss_type: str = "mse"  # "mse" | "l1" | "huber" | "linear_combo" | "uncertainty_weighting"
+    huber_delta: float = 1.0
+    linear_weights: Dict[str, float] = field(default_factory=dict)
+    uw_losses: List[str] = field(default_factory=lambda: ["mse", "l1", "huber"])
+    uw_huber_delta: float = 1.0
 
 
 class SAM(torch.optim.Optimizer):
@@ -139,6 +146,23 @@ class SOAP(torch.optim.Optimizer):
                 v.mul_(beta).addcmul_(grad, grad, value=1 - beta)
                 denom = v.sqrt().add_(eps)
                 p.addcdiv_(grad, denom, value=-lr)
+
+
+class UncertaintyWeightingLoss(nn.Module):
+    """Trainable uncertainty weighting for multiple loss terms."""
+
+    def __init__(self, num_losses: int) -> None:
+        super().__init__()
+        if num_losses <= 0:
+            raise ValueError("num_losses must be positive for UncertaintyWeightingLoss")
+        self.log_vars = nn.Parameter(torch.zeros(num_losses))
+
+    def forward(self, losses: List[torch.Tensor]) -> torch.Tensor:
+        total = 0.0
+        for i, loss in enumerate(losses):
+            precision = torch.exp(-self.log_vars[i])
+            total += 0.5 * precision * loss + 0.5 * self.log_vars[i]
+        return total
 
 
 def _safe_mean(values: Sequence[float]) -> float:
@@ -287,11 +311,85 @@ def compute_loss(model: nn.Module, loader: DataLoader, device: str, loss_fn: nn.
     return float(np.mean(losses)) if losses else float("nan")
 
 
+def _validate_linear_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    allowed = {"mse", "l1", "huber"}
+    unknown = set(weights) - allowed
+    if unknown:
+        raise ValueError(f"Unknown linear_weights keys: {sorted(unknown)}")
+    resolved = {name: float(weights.get(name, 0.0)) for name in allowed}
+    if not any(val > 0 for val in resolved.values()):
+        raise ValueError("linear_weights must include at least one weight > 0")
+    return resolved
+
+
+def _validate_uw_losses(losses: Sequence[str]) -> List[str]:
+    allowed = {"mse", "l1", "huber"}
+    if not losses:
+        raise ValueError("uw_losses must include at least one loss type")
+    normalized = [str(name).lower() for name in losses]
+    unknown = set(normalized) - allowed
+    if unknown:
+        raise ValueError(f"Unknown uw_losses entries: {sorted(unknown)}")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("uw_losses must not contain duplicates")
+    return normalized
+
+
+def compute_training_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: Train2Config,
+    loss_type: str,
+    linear_weights: Optional[Dict[str, float]] = None,
+    uw_losses: Optional[Sequence[str]] = None,
+    uw_module: Optional[UncertaintyWeightingLoss] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute training loss with selectable modes."""
+    components: Dict[str, torch.Tensor] = {}
+    if loss_type == "mse":
+        loss = F.mse_loss(pred, target)
+        return loss, components
+    if loss_type == "l1":
+        loss = F.l1_loss(pred, target)
+        return loss, components
+    if loss_type == "huber":
+        loss = F.huber_loss(pred, target, delta=cfg.huber_delta)
+        return loss, components
+    if loss_type == "linear_combo":
+        if linear_weights is None:
+            raise ValueError("linear_weights must be provided for linear_combo loss")
+        mse_loss = F.mse_loss(pred, target)
+        l1_loss = F.l1_loss(pred, target)
+        huber_loss = F.huber_loss(pred, target, delta=cfg.huber_delta)
+        components = {"mse": mse_loss, "l1": l1_loss, "huber": huber_loss}
+        loss = (
+            linear_weights["mse"] * mse_loss
+            + linear_weights["l1"] * l1_loss
+            + linear_weights["huber"] * huber_loss
+        )
+        return loss, components
+    if loss_type == "uncertainty_weighting":
+        if uw_module is None or uw_losses is None:
+            raise ValueError("uw_losses and uw_module must be provided for uncertainty_weighting loss")
+        loss_map = {
+            "mse": F.mse_loss(pred, target),
+            "l1": F.l1_loss(pred, target),
+            "huber": F.huber_loss(pred, target, delta=cfg.uw_huber_delta),
+        }
+        losses = [loss_map[name] for name in uw_losses]
+        return uw_module(losses), components
+    raise ValueError(f"Unknown loss_type: {cfg.loss_type}")
+
+
 def run_validation_once(
     model: nn.Module,
     loader: DataLoader,
     device: str,
-    loss_fn: nn.Module,
+    cfg: Train2Config,
+    loss_type: str,
+    linear_weights: Optional[Dict[str, float]] = None,
+    uw_losses: Optional[Sequence[str]] = None,
+    uw_module: Optional[UncertaintyWeightingLoss] = None,
 ) -> Tuple[float, Dict[str, float]]:
     model.eval()
     loss_sum = 0.0
@@ -303,7 +401,15 @@ def run_validation_once(
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             pred = model(xb).squeeze(-1)
-            loss = loss_fn(pred, yb)
+            loss, _ = compute_training_loss(
+                pred,
+                yb,
+                cfg,
+                loss_type,
+                linear_weights=linear_weights,
+                uw_losses=uw_losses,
+                uw_module=uw_module,
+            )
             batch_size = yb.shape[0]
             loss_sum += loss.detach().float().cpu().item() * batch_size
             count += batch_size
@@ -334,17 +440,24 @@ def build_model(cfg: Train2Config, input_dim: int) -> nn.Module:
     raise ValueError(f"Unknown model_name: {cfg.model_name}")
 
 
-def build_optimizer(model: nn.Module, config: Train2Config) -> torch.optim.Optimizer:
+def build_optimizer(
+    model: nn.Module,
+    config: Train2Config,
+    extra_params: Optional[Sequence[torch.nn.Parameter]] = None,
+) -> torch.optim.Optimizer:
+    params: List[torch.nn.Parameter] = list(model.parameters())
+    if extra_params:
+        params.extend(list(extra_params))
     name = (config.optimizer_name or "adamw").lower()
     if name == "adamw":
         return torch.optim.AdamW(
-            model.parameters(),
+            params,
             lr=config.lr,
             weight_decay=config.weight_decay,
         )
     if name == "sgd":
         return torch.optim.SGD(
-            model.parameters(),
+            params,
             lr=config.lr,
             weight_decay=config.weight_decay,
             momentum=config.momentum,
@@ -367,14 +480,14 @@ def build_optimizer(model: nn.Module, config: Train2Config) -> torch.optim.Optim
         else:
             raise ValueError(f"Unknown sam_base: {config.sam_base}")
         return SAM(
-            model.parameters(),
+            params,
             base_cls,
             rho=config.sam_rho,
             **base_kwargs,
         )
     if name == "soap":
         return SOAP(
-            model.parameters(),
+            params,
             lr=config.lr,
             beta=config.soap_beta,
             eps=config.soap_eps,
@@ -392,8 +505,21 @@ def train_with_optimizer_switch(
     starts: List[int],
     meta: List[Tuple[int, str, str]],
 ) -> None:
-    optimizer = build_optimizer(model, cfg)
-    loss_fn = nn.MSELoss()
+    loss_type = cfg.loss_type.lower()
+    linear_weights: Optional[Dict[str, float]] = None
+    uw_losses: Optional[List[str]] = None
+    uw_module: Optional[UncertaintyWeightingLoss] = None
+
+    if loss_type == "linear_combo":
+        linear_weights = _validate_linear_weights(cfg.linear_weights)
+    elif loss_type == "uncertainty_weighting":
+        uw_losses = _validate_uw_losses(cfg.uw_losses)
+        uw_module = UncertaintyWeightingLoss(len(uw_losses)).to(cfg.device)
+    elif loss_type not in {"mse", "l1", "huber"}:
+        raise ValueError(f"Unknown loss_type: {cfg.loss_type}")
+
+    extra_params = list(uw_module.parameters()) if uw_module is not None else None
+    optimizer = build_optimizer(model, cfg, extra_params=extra_params)
 
     history = {
         "epoch": [],
@@ -403,6 +529,14 @@ def train_with_optimizer_switch(
         "val_RankIC": [],
         "val_QuantileReturn": [],
     }
+    if loss_type == "linear_combo":
+        history.update(
+            {
+                "train/mse_loss": [],
+                "train/l1_loss": [],
+                "train/huber_loss": [],
+            }
+        )
 
     best_score = float("inf") if cfg.early_stop_metric == "val_loss" else -float("inf")
     best_state = model.state_dict()
@@ -414,13 +548,24 @@ def train_with_optimizer_switch(
         model.train()
         train_loss_sum = torch.tensor(0.0, device=cfg.device)
         train_count = 0
+        mse_sum = torch.tensor(0.0, device=cfg.device)
+        l1_sum = torch.tensor(0.0, device=cfg.device)
+        huber_sum = torch.tensor(0.0, device=cfg.device)
 
         for xb, yb in train_loader:
             xb = xb.to(cfg.device, non_blocking=True)
             yb = yb.to(cfg.device, non_blocking=True)
 
             pred = model(xb).squeeze(-1)
-            loss = loss_fn(pred, yb)
+            loss, components = compute_training_loss(
+                pred,
+                yb,
+                cfg,
+                loss_type,
+                linear_weights=linear_weights,
+                uw_losses=uw_losses,
+                uw_module=uw_module,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -428,7 +573,15 @@ def train_with_optimizer_switch(
             if use_sam:
                 optimizer.first_step(zero_grad=True)
                 pred = model(xb).squeeze(-1)
-                loss = loss_fn(pred, yb)
+                loss, components = compute_training_loss(
+                    pred,
+                    yb,
+                    cfg,
+                    loss_type,
+                    linear_weights=linear_weights,
+                    uw_losses=uw_losses,
+                    uw_module=uw_module,
+                )
                 loss.backward()
                 optimizer.second_step(zero_grad=True)
             else:
@@ -436,11 +589,24 @@ def train_with_optimizer_switch(
 
             train_loss_sum += loss.detach().float() * yb.shape[0]
             train_count += yb.shape[0]
+            if loss_type == "linear_combo":
+                mse_sum += components["mse"].detach() * yb.shape[0]
+                l1_sum += components["l1"].detach() * yb.shape[0]
+                huber_sum += components["huber"].detach() * yb.shape[0]
 
         train_loss = float("nan") if train_count == 0 else (train_loss_sum / train_count).item()
 
         if epoch % cfg.val_every == 0:
-            val_loss, val_metrics = run_validation_once(model, val_loader, cfg.device, loss_fn)
+            val_loss, val_metrics = run_validation_once(
+                model,
+                val_loader,
+                cfg.device,
+                cfg,
+                loss_type,
+                linear_weights=linear_weights,
+                uw_losses=uw_losses,
+                uw_module=uw_module,
+            )
         else:
             val_loss = float("nan")
             val_metrics = {"IC": float("nan"), "RankIC": float("nan"), "R2": float("nan"), "QuantileReturn": float("nan")}
@@ -451,6 +617,15 @@ def train_with_optimizer_switch(
         history["val_IC"].append(val_metrics["IC"])
         history["val_RankIC"].append(val_metrics["RankIC"])
         history["val_QuantileReturn"].append(val_metrics["QuantileReturn"])
+        if loss_type == "linear_combo":
+            if train_count == 0:
+                history["train/mse_loss"].append(float("nan"))
+                history["train/l1_loss"].append(float("nan"))
+                history["train/huber_loss"].append(float("nan"))
+            else:
+                history["train/mse_loss"].append(float((mse_sum / train_count).item()))
+                history["train/l1_loss"].append(float((l1_sum / train_count).item()))
+                history["train/huber_loss"].append(float((huber_sum / train_count).item()))
 
         print(
             f"[Epoch {epoch:03d}] "
