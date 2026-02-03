@@ -46,6 +46,82 @@ def make_norm(
     raise ValueError(f"Unknown norm_type: {norm_type}")
 
 
+def apply_sequence_norm(
+    x: torch.Tensor,
+    norm: Optional[nn.Module],
+    norm_type: Optional[str],
+) -> torch.Tensor:
+    """Apply normalization to (B, T, C) tensors with optional channel-first norms."""
+    if norm is None or norm_type is None:
+        return x
+    if norm_type == "ln":
+        return norm(x)
+    x = x.transpose(1, 2)
+    x = norm(x)
+    return x.transpose(1, 2)
+
+
+# ======================================================
+# RNN variants (optional normalization)
+# ======================================================
+
+
+class GRUModelWithNorm(nn.Module):
+    """GRU with optional activation normalization on outputs."""
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        norm_type: Optional[str] = None,
+        num_groups: int = 4,
+    ) -> None:
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=config.input_dim,
+            hidden_size=config.hidden_dim,
+            num_layers=config.num_layers,
+            batch_first=True,
+            dropout=config.dropout if config.num_layers > 1 else 0.0,
+        )
+        self.norm_type = norm_type.lower() if norm_type is not None else None
+        self.norm = make_norm(self.norm_type, config.hidden_dim, num_groups=num_groups)
+        self.head = nn.Linear(config.hidden_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = self.gru(x)
+        output = apply_sequence_norm(output, self.norm, self.norm_type)
+        last = output[:, -1, :]
+        return self.head(last)
+
+
+class LSTMModelWithNorm(nn.Module):
+    """LSTM with optional activation normalization on outputs."""
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        norm_type: Optional[str] = None,
+        num_groups: int = 4,
+    ) -> None:
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=config.input_dim,
+            hidden_size=config.hidden_dim,
+            num_layers=config.num_layers,
+            batch_first=True,
+            dropout=config.dropout if config.num_layers > 1 else 0.0,
+        )
+        self.norm_type = norm_type.lower() if norm_type is not None else None
+        self.norm = make_norm(self.norm_type, config.hidden_dim, num_groups=num_groups)
+        self.head = nn.Linear(config.hidden_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = self.lstm(x)
+        output = apply_sequence_norm(output, self.norm, self.norm_type)
+        last = output[:, -1, :]
+        return self.head(last)
+
+
 # ======================================================
 # TCN variants (WeightNorm)
 # ======================================================
@@ -292,39 +368,78 @@ class TransformerModelPreLN(nn.Module):
         return self.head(last)
 
 
+class EncoderBlockPreNormWithNorm(nn.Module):
+    """Transformer encoder block with configurable Pre-Norm."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        norm_type: Optional[str],
+        num_groups: int,
+    ) -> None:
+        super().__init__()
+        self.norm_type = norm_type.lower() if norm_type is not None else None
+        self.norm_attn = make_norm(self.norm_type, hidden_dim, num_groups=num_groups)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.norm_ffn = make_norm(self.norm_type, hidden_dim, num_groups=num_groups)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x: (B, T, C)
+        attn_in = apply_sequence_norm(x, self.norm_attn, self.norm_type)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, attn_mask=mask, need_weights=False)
+        x = x + self.attn_dropout(attn_out)
+        ffn_in = apply_sequence_norm(x, self.norm_ffn, self.norm_type)
+        x = x + self.ffn(ffn_in)
+        return x
+
+
 class TransformerModelPreLNWithNorm(nn.Module):
-    """Transformer with Pre-LN + optional extra normalization."""
+    """Transformer with Pre-Norm encoder blocks and configurable norm type."""
 
     def __init__(
         self,
         config: ModelConfig,
         num_heads: int = 2,
-        input_norm: bool = False,
-        output_norm: bool = False,
+        norm_type: Optional[str] = None,
+        num_groups: int = 4,
     ) -> None:
         super().__init__()
         if config.hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
         self.num_heads = num_heads
-        self.input_norm = nn.LayerNorm(config.input_dim) if input_norm else None
+        self.norm_type = norm_type.lower() if norm_type is not None else None
         self.input_proj = nn.Linear(config.input_dim, config.hidden_dim)
         self.blocks = nn.ModuleList(
             [
-                EncoderBlockPreLN(
+                EncoderBlockPreNormWithNorm(
                     hidden_dim=config.hidden_dim,
                     num_heads=num_heads,
                     dropout=config.dropout,
+                    norm_type=self.norm_type,
+                    num_groups=num_groups,
                 )
                 for _ in range(config.num_layers)
             ]
         )
-        self.output_norm = nn.LayerNorm(config.hidden_dim) if output_norm else None
         self.head = nn.Linear(config.hidden_dim, 1)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, T, F)
-        if self.input_norm is not None:
-            x = self.input_norm(x)
         x = self.input_proj(x)
         if mask is not None:
             if mask.dim() == 2:
@@ -340,8 +455,6 @@ class TransformerModelPreLNWithNorm(nn.Module):
 
         for block in self.blocks:
             x = block(x, mask=mask)
-        if self.output_norm is not None:
-            x = self.output_norm(x)
         last = x[:, -1, :]
         return self.head(last)
 
@@ -366,6 +479,8 @@ __all__ = [
     "TCNModelWN",
     "TransformerModelPreLN",
     # norm-augmented variants
+    "GRUModelWithNorm",
+    "LSTMModelWithNorm",
     "TCNModelWNWithNorm",
     "TransformerModelPreLNWithNorm",
     "count_parameters",

@@ -16,7 +16,17 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from dataset.block_dataset import BlockDataset, IndexEntry
-from model import GRUModel, LSTMModel, ModelConfig, TCNModel, TransformerModel
+from model import ModelConfig
+from model1 import (
+    GRUModel,
+    GRUModelWithNorm,
+    LSTMModel,
+    LSTMModelWithNorm,
+    TCNModel,
+    TCNModelWNWithNorm,
+    TransformerModel,
+    TransformerModelPreLNWithNorm,
+)
 
 
 @dataclass
@@ -43,6 +53,8 @@ class Train2Config:
     hidden_dim: int = 16
     num_layers: int = 1
     dropout: float = 0.1
+    norm_type: Optional[str] = None  # None | "bn" | "ln" | "in" | "gn"
+    norm_groups: int = 4
 
     optimizer_name: str = "adamw"  # "adamw" | "sgd" | "sam" | "soap"
     lr: float = 1e-3
@@ -429,14 +441,27 @@ def build_model(cfg: Train2Config, input_dim: int) -> nn.Module:
         dropout=cfg.dropout,
     )
     name = cfg.model_name.lower()
+    norm_type = cfg.norm_type.lower() if cfg.norm_type is not None else None
     if name == "gru":
-        return GRUModel(model_cfg)
+        if norm_type is None:
+            return GRUModel(model_cfg)
+        return GRUModelWithNorm(model_cfg, norm_type=norm_type, num_groups=cfg.norm_groups)
     if name == "lstm":
-        return LSTMModel(model_cfg)
+        if norm_type is None:
+            return LSTMModel(model_cfg)
+        return LSTMModelWithNorm(model_cfg, norm_type=norm_type, num_groups=cfg.norm_groups)
     if name == "tcn":
-        return TCNModel(model_cfg)
+        if norm_type is None:
+            return TCNModel(model_cfg)
+        return TCNModelWNWithNorm(model_cfg, norm_type=norm_type, num_groups=cfg.norm_groups)
     if name == "transformer":
-        return TransformerModel(model_cfg)
+        if norm_type is None:
+            return TransformerModel(model_cfg)
+        return TransformerModelPreLNWithNorm(
+            model_cfg,
+            norm_type=norm_type,
+            num_groups=cfg.norm_groups,
+        )
     raise ValueError(f"Unknown model_name: {cfg.model_name}")
 
 
