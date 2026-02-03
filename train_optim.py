@@ -461,8 +461,6 @@ def build_model(cfg: Train2Config, input_dim: int) -> nn.Module:
             model_cfg,
             norm_type=norm_type,
             num_groups=cfg.norm_groups,
-            input_norm=True,
-            output_norm=True,
         )
     raise ValueError(f"Unknown model_name: {cfg.model_name}")
 
