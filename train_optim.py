@@ -55,6 +55,8 @@ class Train2Config:
     dropout: float = 0.1
     norm_type: Optional[str] = None  # None | "bn" | "ln" | "in" | "gn"
     norm_groups: int = 4
+    pos_encoding: Optional[str] = None  # None | "sin" | "learned"
+    pos_max_len: int = 512
 
     optimizer_name: str = "adamw"  # "adamw" | "sgd" | "sam" | "soap"
     lr: float = 1e-3
@@ -442,6 +444,8 @@ def build_model(cfg: Train2Config, input_dim: int) -> nn.Module:
     )
     name = cfg.model_name.lower()
     norm_type = cfg.norm_type.lower() if cfg.norm_type is not None else None
+    pos_encoding = cfg.pos_encoding.lower() if cfg.pos_encoding is not None else None
+    pos_max_len = max(cfg.pos_max_len, cfg.window)
     if name == "gru":
         if norm_type is None:
             return GRUModel(model_cfg)
@@ -455,12 +459,14 @@ def build_model(cfg: Train2Config, input_dim: int) -> nn.Module:
             return TCNModel(model_cfg)
         return TCNModelWNWithNorm(model_cfg, norm_type=norm_type, num_groups=cfg.norm_groups)
     if name == "transformer":
-        if norm_type is None:
+        if norm_type is None and pos_encoding is None:
             return TransformerModel(model_cfg)
         return TransformerModelPreLNWithNorm(
             model_cfg,
             norm_type=norm_type,
             num_groups=cfg.norm_groups,
+            pos_encoding=pos_encoding,
+            pos_max_len=pos_max_len,
         )
     raise ValueError(f"Unknown model_name: {cfg.model_name}")
 

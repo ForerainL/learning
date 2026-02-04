@@ -6,6 +6,7 @@ implementations for TCN (WeightNorm) and Transformer (Pre-LN).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -294,6 +295,80 @@ class TCNModelWNWithNorm(nn.Module):
 # ======================================================
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    """Fixed sinusoidal positional encoding."""
+
+    def __init__(self, hidden_dim: int, max_len: int = 512) -> None:
+        super().__init__()
+        if max_len <= 0:
+            raise ValueError("max_len must be positive for positional encoding")
+        self.hidden_dim = hidden_dim
+        self.max_len = max_len
+        pe = self._build_encoding(max_len, hidden_dim, device=None, dtype=torch.float32)
+        self.register_buffer("pe", pe, persistent=False)
+
+    @staticmethod
+    def _build_encoding(
+        length: int,
+        hidden_dim: int,
+        *,
+        device: Optional[torch.device],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        position = torch.arange(length, device=device, dtype=dtype).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, hidden_dim, 2, device=device, dtype=dtype)
+            * (-math.log(10000.0) / hidden_dim)
+        )
+        pe = torch.zeros(length, hidden_dim, device=device, dtype=dtype)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(1)
+        if seq_len <= self.pe.size(0):
+            pe = self.pe[:seq_len].to(dtype=x.dtype, device=x.device)
+        else:
+            pe = self._build_encoding(seq_len, self.hidden_dim, device=x.device, dtype=x.dtype)
+        return x + pe.unsqueeze(0)
+
+
+class LearnablePositionalEncoding(nn.Module):
+    """Learnable positional encoding via embedding lookup."""
+
+    def __init__(self, hidden_dim: int, max_len: int = 512) -> None:
+        super().__init__()
+        if max_len <= 0:
+            raise ValueError("max_len must be positive for positional encoding")
+        self.embedding = nn.Embedding(max_len, hidden_dim)
+        self.max_len = max_len
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(1)
+        if seq_len > self.max_len:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds learnable positional max_len {self.max_len}."
+            )
+        positions = torch.arange(seq_len, device=x.device)
+        return x + self.embedding(positions).unsqueeze(0)
+
+
+def make_positional_encoding(
+    encoding_type: Optional[str],
+    hidden_dim: int,
+    max_len: int,
+) -> Optional[nn.Module]:
+    if encoding_type is None:
+        return None
+    enc = encoding_type.lower()
+    if enc in {"sin", "sinusoidal"}:
+        return SinusoidalPositionalEncoding(hidden_dim, max_len=max_len)
+    if enc in {"learned", "learnable"}:
+        return LearnablePositionalEncoding(hidden_dim, max_len=max_len)
+    raise ValueError(f"Unknown positional encoding type: {encoding_type}")
+
+
 class EncoderBlockPreLN(nn.Module):
     """Transformer encoder block with Pre-LayerNorm."""
 
@@ -329,12 +404,19 @@ class EncoderBlockPreLN(nn.Module):
 class TransformerModelPreLN(nn.Module):
     """Standard Transformer encoder with Pre-LayerNorm."""
 
-    def __init__(self, config: ModelConfig, num_heads: int = 2):
+    def __init__(
+        self,
+        config: ModelConfig,
+        num_heads: int = 2,
+        pos_encoding: Optional[str] = None,
+        pos_max_len: int = 512,
+    ):
         super().__init__()
         if config.hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
         self.num_heads = num_heads
         self.input_proj = nn.Linear(config.input_dim, config.hidden_dim)
+        self.pos_encoding = make_positional_encoding(pos_encoding, config.hidden_dim, pos_max_len)
         self.blocks = nn.ModuleList(
             [
                 EncoderBlockPreLN(
@@ -350,6 +432,8 @@ class TransformerModelPreLN(nn.Module):
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, T, F) -> (B, T, C)
         x = self.input_proj(x)
+        if self.pos_encoding is not None:
+            x = self.pos_encoding(x)
         if mask is not None:
             if mask.dim() == 2:
                 pass
@@ -417,6 +501,8 @@ class TransformerModelPreLNWithNorm(nn.Module):
         num_heads: int = 2,
         norm_type: Optional[str] = None,
         num_groups: int = 4,
+        pos_encoding: Optional[str] = None,
+        pos_max_len: int = 512,
     ) -> None:
         super().__init__()
         if config.hidden_dim % num_heads != 0:
@@ -424,6 +510,7 @@ class TransformerModelPreLNWithNorm(nn.Module):
         self.num_heads = num_heads
         self.norm_type = norm_type.lower() if norm_type is not None else None
         self.input_proj = nn.Linear(config.input_dim, config.hidden_dim)
+        self.pos_encoding = make_positional_encoding(pos_encoding, config.hidden_dim, pos_max_len)
         self.blocks = nn.ModuleList(
             [
                 EncoderBlockPreNormWithNorm(
@@ -441,6 +528,8 @@ class TransformerModelPreLNWithNorm(nn.Module):
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, T, F)
         x = self.input_proj(x)
+        if self.pos_encoding is not None:
+            x = self.pos_encoding(x)
         if mask is not None:
             if mask.dim() == 2:
                 pass
