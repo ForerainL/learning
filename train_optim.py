@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import pickle
+import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -41,6 +42,7 @@ class Train2Config:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     save_dir: str = "./artifacts"
     run_name: str = "train2"
+    num_workers: int = 0
 
     train_start: str = "20220101"
     train_end: str = "20231231"
@@ -72,6 +74,26 @@ class Train2Config:
     linear_weights: Dict[str, float] = field(default_factory=dict)
     uw_losses: List[str] = field(default_factory=lambda: ["mse", "l1", "huber"])
     uw_huber_delta: float = 1.0
+    model_seed: Optional[int] = None
+    dataloader_seed: Optional[int] = None
+
+
+def set_model_seed(seed: int) -> None:
+    """Seed model-related RNGs once before model construction."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def seed_dataloader_worker(worker_id: int) -> None:
+    """PyTorch-recommended worker seeding based on each worker's initial seed."""
+    del worker_id
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 class SAM(torch.optim.Optimizer):
@@ -704,6 +726,10 @@ def main() -> None:
     cfg = Train2Config()
     os.makedirs(cfg.save_dir, exist_ok=True)
 
+    # Keep model initialization randomness independent from data-order randomness.
+    if cfg.model_seed is not None:
+        set_model_seed(cfg.model_seed)
+
     segment_table_path = os.path.join(cfg.tensor_root, "segment_table.pkl")
     with open(segment_table_path, "rb") as f:
         segments = pickle.load(f)
@@ -717,29 +743,40 @@ def main() -> None:
     val_ds = BlockDataset(val_index, cfg.tensor_root, cfg.window)
     test_ds = BlockDataset(test_index, cfg.tensor_root, cfg.window)
 
+    # Keep DataLoader RNG separate so shuffling can be controlled independently.
+    train_generator = None
+    worker_init_fn = None
+    if cfg.dataloader_seed is not None:
+        train_generator = torch.Generator()
+        train_generator.manual_seed(cfg.dataloader_seed)
+        if cfg.num_workers > 0:
+            worker_init_fn = seed_dataloader_worker
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=cfg.num_workers,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=cfg.num_workers > 0,
+        generator=train_generator,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=cfg.num_workers,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=cfg.num_workers > 0,
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=cfg.num_workers,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=cfg.num_workers > 0,
     )
 
     feature_dim = train_ds.x_all.shape[1]
